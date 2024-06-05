@@ -1,1 +1,4 @@
 /data
+# notebooks
+/notebooks/*.html
+/notebooks/*_files/
