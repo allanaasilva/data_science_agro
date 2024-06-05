@@ -1,0 +1,821 @@
+---
+title: Desafio - Data Science
+format:
+  html:
+    code-fold: true
+jupyter: python3
+execute:
+  cache: false
+theme:
+  light: cosmo
+  dark: darkly
+warning: false
+---
+
+
+```{python}
+# | code-fold: true
+import os
+os.chdir('..')
+```
+
+
+```{python}
+# | code-fold: true
+import warnings
+warnings.filterwarnings("ignore")
+
+import pandas as pd
+import numpy as np
+import geopandas as gpd
+import plotly.graph_objects as go
+import plotly.express as px
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+from sklearn.cluster import DBSCAN
+from sklearn.preprocessing import StandardScaler
+import contextily as ctx
+from pykrige.ok import OrdinaryKriging
+from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from scipy.interpolate import griddata
+
+from src.utils.evaluation.statistical_tests import kruskal_nemenyi
+from src.utils.features.auxiliary_functions import std_medians, obter_estacao
+```
+
+
+## Etapa 1: obtenção dos dados
+
+A primeira etapa envolveu a obtenção dos arquivos que compõem o shapefile, disponibilizados no s3. Esses arquivos foram salvos em data/raw, e o código completo que lê e salva esses arquivos está disponível em **obtain_s3_files.py**.
+
+```{python}
+# | code-fold: true
+# Caminho para os arquivos do shapefile
+shp_file = 'data/raw/tabela_geometria.shp'
+tabela_geometria = gpd.read_file(shp_file)
+tabela_geometria.head()
+```
+
+
+Ainda nesta esta, os dados da tabela denominada 'talhao' foram salvos no formato parquet para economia de espaço em disco e por ser mais otimizado para processamento. Esta tabela continha mais informações relacionadas às safras em comparação com as demais disponibilizadas através do Postgres. O código completo que lê e salva este arquivo está disponível em **obtain_talhao_data.py**.
+
+```{python}
+# | code-fold: true
+talhao_file = 'data/raw/talhao.parquet'
+talhao = pd.read_parquet(talhao_file)
+talhao.head()
+```
+
+
+### Culturas mais cultivadas
+
+
+```{python}
+# | code-fold: true
+count_crop = talhao['ocupacao'].value_counts()
+fig = px.bar(count_crop, x=count_crop.index, y=count_crop.values,
+             color=count_crop.index, text=count_crop.values,
+             labels={'ocupacao': 'CULTURA', 'y': 'Total'},
+             template='seaborn',
+             title='<b> Número de vezes em que cada cultura foi cultivada')
+fig.update_traces(showlegend=False)
+fig.update_yaxes(tickformat="000")
+fig.show()
+```
+
+
+Como a soja foi significativamente mais cultivada quando comparada às demais culturas,  todo o trabalho foi desenvolvido considerando exclusivamente a soja.
+
+
+### Junção das demais tabelas e criação de um único dataframe
+
+No script **combine_all_data.py** é criado um único dataframe que integra as informações da tabela de meteorologia, os dados espaciais dos talhões e os dados presentes na tabela 'talhao', mensionada anteriormente.
+Estes dados foram salvos como shapefiles.
+
+```{python}
+# | code-fold: true
+shp_file = 'data/interim/talhao_with_geo_info.shp'
+talhao_spatial_data = gpd.read_file(shp_file)
+talhao_spatial_data.head()
+```
+
+
+## Etapa 2: Definição da hipótese e dos objetivos
+
+**Hipótese de trabalho**: A produtividade das safras será influenciada por uma combinação de fatores, incluindo a textura do solo, as condições meteorológicas, localização do talhão, entre outros.
+
+O **objetivo** da pesquisa é identificar os principais fatores que impactam a produtividade das safras em diferentes fazendas, e gerar insights que possam ser utilizados para otimizar a gestão agrícola e melhorar a eficiência produtiva.
+
+
+### Textura do solo e produtividade
+
+```{python}
+# | code-fold: true
+talhao_meteorologia_data = pd.read_parquet(
+    'data/interim/talhao_meteorologia_data.parquet')
+talhao_meteorologia_data = talhao_meteorologia_data.replace([np.inf, -np.inf],
+                                                            np.nan)
+talhao_meteorologia_data = talhao_meteorologia_data.apply(
+    lambda x: pd.to_numeric(x, errors='ignore'))
+
+grouped_data = talhao_meteorologia_data.groupby('textura_solo_descricao')[
+    'produtividade'].agg(['count', lambda x: np.mean(x[
+        np.isfinite(x)])]).reset_index()
+grouped_data.columns = ['textura_solo_descricao', 'count', 'mean']
+
+mean_productivity = grouped_data.sort_values(by='mean',
+                                             ascending=False)
+
+mean_productivity['mean'] = round(mean_productivity[
+    'mean'], 2)
+
+fig = px.bar(mean_productivity, x='textura_solo_descricao', y='mean',
+             color='textura_solo_descricao',
+             labels={'textura_solo_descricao': 'TEXTURA SOLO',
+                     'mean': 'PROD. MÉDIA'},
+             text='count',
+             template='seaborn',
+             title='<b> Prod. Média por textura do solo')
+fig.update_yaxes(tickformat="000")
+fig.update_traces(textfont_size=8, showlegend=False)
+fig.show()
+```
+
+A primeira análise visa entender se a textura do solo é um fator que influencia na produtividade.
+Para as variedades de soja em geral, a textura **média 15%-35%** se mostrou mais favorável (em média) à produtividade.
+Os números vistos no interior das barras mostram o tamanho da amostra para aquela caegoria em específico. Através dele, é possível notar que o solo **argiloso 35%-60%** foi o mais frequente no período.
+
+```{python}
+# | code-fold: true
+talhao_meteorologia_data = talhao_meteorologia_data.dropna(
+    subset=['produtividade', 'textura_solo_descricao'])
+talhao_meteorologia_data = talhao_meteorologia_data[np.isfinite(
+    talhao_meteorologia_data['produtividade'])]
+kruskal_nemenyi(data=talhao_meteorologia_data,
+                col_cat='textura_solo_descricao',
+                col_num='produtividade')
+
+talhao_meteorologia_data.groupby('textura_solo_descricao')[
+    'produtividade'].describe()
+```
+
+
+
+Avaliando os p-valores das comparações duas a duas, nota-se que o teste revelou haver diferença significativa (valor-p < 0.050)entre as produtividades de todos os solos.
+O resultado acima pode ser interpretado da seguinte forma: os valores represenam a diferença das médias, em valor absoluto, das produtividades dos solos. O '*' indica que a hipótese nula do teste (de que não existe diferença entre as produtividades dos diferentes solos) foi rejeitada. 
+
+
+**Considerando as variedades mais comuns**
+
+Acima analisamos as variedades de soja como um todo, mas agora vamos ver se isolando as variedades (as 3 mais frequentes), o comportamento se repete.
+
+::: {.panel-tabset}
+
+
+## Variedade 1
+
+```{python}
+# | code-fold: true
+talhao_meteorologia_data['variedade'] = talhao_meteorologia_data[
+    'variedade'].astype(str)
+rank_variety = talhao_meteorologia_data[
+    'variedade'].value_counts().sort_values(ascending=False)
+top_variety = rank_variety.head(3)
+
+talhao_meteorologia_data_variety_1 = talhao_meteorologia_data[
+    (talhao_meteorologia_data['variedade'] == top_variety.index[0])]
+
+grouped_data = talhao_meteorologia_data_variety_1.groupby(
+    'textura_solo_descricao')['produtividade'].agg([
+        'mean', 'count']).reset_index()
+
+grouped_data.columns = ['textura_solo_descricao', 'produtividade', 'count']
+mean_productivity = grouped_data.sort_values(by='produtividade',
+                                             ascending=False)
+
+mean_productivity['produtividade'] = round(mean_productivity[
+    'produtividade'], 2)
+
+fig = px.bar(mean_productivity, x='textura_solo_descricao', y='produtividade',
+             color='textura_solo_descricao',
+             labels={'textura_solo_descricao': 'TEXTURA SOLO',
+                     'produtividade': 'PROD. MÉDIA'},
+             text='count',
+             template='seaborn',
+             title='<b> Prod. Média por textura do solo - variedade ' +
+             top_variety.index[0])
+fig.update_yaxes(tickformat="000")
+fig.update_traces(textfont_size=8)
+fig.show()
+```
+
+
+## Variedade 2
+
+```{python}
+# | code-fold: true
+talhao_meteorologia_data_variety_2 = talhao_meteorologia_data[
+    (talhao_meteorologia_data['variedade'] == top_variety.index[1])]
+
+grouped_data = talhao_meteorologia_data_variety_2.groupby(
+    'textura_solo_descricao')['produtividade'].agg([
+        'mean', 'count']).reset_index()
+
+grouped_data.columns = ['textura_solo_descricao', 'produtividade', 'count']
+mean_productivity = grouped_data.sort_values(by='produtividade',
+                                             ascending=False)
+
+mean_productivity['produtividade'] = round(mean_productivity[
+    'produtividade'], 2)
+
+fig = px.bar(mean_productivity, x='textura_solo_descricao', y='produtividade',
+             color='textura_solo_descricao',
+             labels={'textura_solo_descricao': 'TEXTURA SOLO',
+                     'produtividade': 'PROD. MÉDIA'},
+             text='count',
+             template='seaborn',
+             title='<b> Prod. Média por textura do solo - variedade ' +
+             top_variety.index[1])
+fig.update_yaxes(tickformat="000")
+fig.update_traces(textfont_size=8)
+fig.show()
+```
+
+
+## Variedade 3
+
+```{python}
+# | code-fold: true
+talhao_meteorologia_data_variety_3 = talhao_meteorologia_data[
+    (talhao_meteorologia_data['variedade'] == top_variety.index[2])]
+
+grouped_data = talhao_meteorologia_data_variety_3.groupby(
+    'textura_solo_descricao')['produtividade'].agg([
+        'mean', 'count']).reset_index()
+
+grouped_data.columns = ['textura_solo_descricao', 'produtividade', 'count']
+mean_productivity = grouped_data.sort_values(by='produtividade',
+                                             ascending=False)
+
+mean_productivity['produtividade'] = round(mean_productivity[
+    'produtividade'], 2)
+
+fig = px.bar(mean_productivity, x='textura_solo_descricao', y='produtividade',
+             color='textura_solo_descricao',
+             labels={'textura_solo_descricao': 'TEXTURA SOLO',
+                     'produtividade': 'PROD. MÉDIA'},
+             text='count',
+             template='seaborn',
+             title='<b> Prod. Média por textura do solo - variedade ' +
+             top_variety.index[2])
+fig.update_yaxes(tickformat="000")
+fig.update_traces(textfont_size=8)
+fig.show()
+```
+
+:::
+
+Ao isolarmos as 3 variedades mais frequentes nos dados, vemos que o padrão visto anteriormente se alterou: a textura do solo **média 15%-35** não se manteve associada a uma maior produtividade. Desta forma, levar em conta a variedade da soja se mostra relevante.
+
+### Estação de plantio e produtividade
+
+```{python}
+# | code-fold: true
+talhao_meteorologia_data['data_plantio_inicio'] = pd.to_datetime(talhao_meteorologia_data['data_plantio_inicio'], format='%Y-%m-%d')
+talhao_meteorologia_data['estacao_plantio'] = talhao_meteorologia_data[
+    'data_plantio_inicio'].apply(obter_estacao)
+count_season = talhao_meteorologia_data['estacao_plantio'].value_counts()
+porc_season = talhao_meteorologia_data['estacao_plantio'].value_counts(
+    normalize=True).mul(100).round(2)
+pd.concat([count_season, porc_season], axis=1, keys=['Freq', '%'])
+```
+
+A partir da tabela criada, podemos ver que a maior parte dos plantios foram realizados na Primavera, totalizando cerca de 53% de todos os plantios de soja.
+
+
+```{python}
+# | code-fold: true
+grouped_data = talhao_meteorologia_data.groupby('estacao_plantio')[
+    'produtividade'].agg(['mean', 'count']).reset_index()
+
+grouped_data.columns = ['estacao_plantio', 'produtividade', 'count']
+mean_productivity = grouped_data.sort_values(by='produtividade',
+                                             ascending=False)
+
+mean_productivity['produtividade'] = round(mean_productivity[
+    'produtividade'], 2)
+
+fig = px.bar(mean_productivity, x='estacao_plantio', y='produtividade',
+             color='estacao_plantio',
+             labels={'estacao_plantio': 'ESTAÇÃO PLANTIO',
+                     'produtividade': 'PROD. MÉDIA'},
+             text='count',
+             template='seaborn',
+             title='<b> Prod. Média por estação de plantio')
+fig.update_yaxes(tickformat="000")
+fig.update_traces(textfont_size=8)
+fig.show()
+```
+
+
+Em média, plantar as variedades de soja no verão leva a uma maior produtividade.
+
+```{python}
+# | code-fold: true
+talhao_meteorologia_data = talhao_meteorologia_data.dropna(
+    subset='estacao_plantio')
+kruskal_nemenyi(data=talhao_meteorologia_data,
+                col_cat='estacao_plantio',
+                col_num='produtividade')
+
+talhao_meteorologia_data.groupby('estacao_plantio')[
+    'produtividade'].describe()
+```
+
+Avaliando os p-valores das comparações duas a duas, nota-se que o teste revelou haver diferença significativa (valor-p < 0.050)entre as produtividades, a depender da estação em que o plantio foi feito.
+
+
+**Considerando as variedades mais comuns**
+
+::: {.panel-tabset}
+
+
+## Variedade 1
+
+```{python}
+# | code-fold: true
+talhao_meteorologia_data_variety_1 = talhao_meteorologia_data[(talhao_meteorologia_data[
+    'variedade'] == top_variety.index[0])]
+
+grouped_data = talhao_meteorologia_data_variety_1.groupby(
+    'estacao_plantio')['produtividade'].agg([
+        'mean', 'count']).reset_index()
+
+grouped_data.columns = ['estacao_plantio', 'produtividade', 'count']
+mean_productivity = grouped_data.sort_values(by='produtividade',
+                                             ascending=False)
+
+mean_productivity['produtividade'] = round(mean_productivity[
+    'produtividade'], 2)
+
+fig = px.bar(mean_productivity, x='estacao_plantio', y='produtividade',
+             color='estacao_plantio',
+             labels={'estacao_plantio': 'ESTAÇÃO PLANTIO',
+                     'produtividade': 'PROD. MÉDIA'},
+             text='count',
+             template='seaborn',
+             title='<b> Prod. Média por estação de plantio - variedade ' +
+             top_variety.index[0])
+fig.update_yaxes(tickformat="000")
+fig.update_traces(textfont_size=8)
+fig.show()
+```
+
+
+## Variedade 2
+
+```{python}
+# | code-fold: true
+talhao_meteorologia_data_variety_2 = talhao_meteorologia_data[(talhao_meteorologia_data[
+    'variedade'] == top_variety.index[1])]
+
+grouped_data = talhao_meteorologia_data_variety_2.groupby(
+    'estacao_plantio')['produtividade'].agg([
+        'mean', 'count']).reset_index()
+
+grouped_data.columns = ['estacao_plantio', 'produtividade', 'count']
+mean_productivity = grouped_data.sort_values(by='produtividade',
+                                             ascending=False)
+
+mean_productivity['produtividade'] = round(mean_productivity[
+    'produtividade'], 2)
+
+fig = px.bar(mean_productivity, x='estacao_plantio', y='produtividade',
+             color='estacao_plantio',
+             labels={'estacao_plantio': 'ESTAÇÃO PLANTIO',
+                     'produtividade': 'PROD. MÉDIA'},
+             text='count',
+             template='seaborn',
+             title='<b> Prod. Média por estação de plantio - variedade ' +
+             top_variety.index[1])
+fig.update_yaxes(tickformat="000")
+fig.update_traces(textfont_size=8)
+fig.show()
+```
+
+
+## Variedade 3
+
+```{python}
+# | code-fold: true
+talhao_meteorologia_data_variety_3 = talhao_meteorologia_data[(talhao_meteorologia_data[
+    'variedade'] == top_variety.index[2])]
+
+grouped_data = talhao_meteorologia_data_variety_3.groupby(
+    'estacao_plantio')['produtividade'].agg([
+        'mean', 'count']).reset_index()
+
+grouped_data.columns = ['estacao_plantio', 'produtividade', 'count']
+mean_productivity = grouped_data.sort_values(by='produtividade',
+                                             ascending=False)
+
+mean_productivity['produtividade'] = round(mean_productivity[
+    'produtividade'], 2)
+
+fig = px.bar(mean_productivity, x='estacao_plantio', y='produtividade',
+             color='estacao_plantio',
+             labels={'estacao_plantio': 'ESTAÇÃO DE PLANTIO',
+                     'produtividade': 'PROD. MÉDIA'},
+             text='count',
+             template='seaborn',
+             title='<b> Prod. Média por estação de plantio - variedade ' +
+             top_variety.index[2])
+fig.update_yaxes(tickformat="000")
+fig.update_traces(textfont_size=8)
+fig.show()
+```
+
+:::
+
+Nota-se um padrão diferente nas variedades mais frequentes, quanto a produtividade associada à estação de plantio, à exceção da variedade 980. Novamente, mostra-se relevante levar em conta as especificidades de cada variedade.
+
+### Estação de colheita e produtividade
+
+```{python}
+# | code-fold: true
+talhao_meteorologia_data['data_colheita_inicio'] = pd.to_datetime(
+    talhao_meteorologia_data['data_colheita_inicio'], format='%Y-%m-%d')
+talhao_meteorologia_data['estacao_colheita'] = talhao_meteorologia_data[
+    'data_colheita_inicio'].apply(obter_estacao)
+count_season = talhao_meteorologia_data['estacao_colheita'].value_counts()
+porc_season = talhao_meteorologia_data['estacao_colheita'].value_counts(
+    normalize=True).mul(100).round(2)
+pd.concat([count_season, porc_season], axis=1, keys=['Freq', '%'])
+```
+
+A partir da tabela criada, podemos ver que a maior parte das colheitas são realizados no Verão, totalizando cerca de 47%.
+
+
+```{python}
+# | code-fold: true
+grouped_data = talhao_meteorologia_data.groupby('estacao_colheita')[
+    'produtividade'].agg(['mean', 'count']).reset_index()
+
+grouped_data.columns = ['estacao_colheita', 'produtividade', 'count']
+mean_productivity = grouped_data.sort_values(by='produtividade',
+                                             ascending=False)
+
+mean_productivity['produtividade'] = round(mean_productivity[
+    'produtividade'], 2)
+
+fig = px.bar(mean_productivity, x='estacao_colheita', y='produtividade',
+             color='estacao_colheita',
+             labels={'estacao_colheita': 'ESTAÇÃO COLHEITA',
+                     'produtividade': 'PROD. MÉDIA'},
+             text='count',
+             template='seaborn',
+             title='<b> Prod. Média por estação de colheita')
+fig.update_yaxes(tickformat="000")
+fig.update_traces(textfont_size=8)
+fig.show()
+```
+
+Colher no inverno trouxe uma produtividade média superior a colher nas demais estações. Quase não houveram colheitas na primavera.
+
+```{python}
+# | code-fold: true
+talhao_meteorologia_data = talhao_meteorologia_data.dropna(
+    subset='estacao_colheita')
+kruskal_nemenyi(data=talhao_meteorologia_data,
+                col_cat='estacao_colheita',
+                col_num='produtividade')
+
+talhao_meteorologia_data.groupby('estacao_colheita')[
+    'produtividade'].describe()
+```
+
+Avaliando os p-valores das comparações duas a duas, nota-se que o teste revelou haver diferença significativa (valor-p < 0.050)entre as produtividades nas diferentes estações de colheita, à exceção da primavera (pouquíssimo frequente).
+
+**Considerando as variedades mais comuns**
+
+::: {.panel-tabset}
+
+
+## Variedade 1
+
+```{python}
+# | code-fold: true
+talhao_meteorologia_data_variety_1 = talhao_meteorologia_data[
+    (talhao_meteorologia_data['variedade'] == top_variety.index[0])]
+
+grouped_data = talhao_meteorologia_data_variety_1.groupby(
+    'estacao_colheita')['produtividade'].agg([
+        'mean', 'count']).reset_index()
+
+grouped_data.columns = ['estacao_colheita', 'produtividade', 'count']
+mean_productivity = grouped_data.sort_values(by='produtividade',
+                                             ascending=False)
+
+mean_productivity['produtividade'] = round(mean_productivity[
+    'produtividade'], 2)
+
+fig = px.bar(mean_productivity, x='estacao_colheita', y='produtividade',
+             color='estacao_colheita',
+             labels={'estacao_colheita': 'ESTAÇÃO COLHEITA',
+                     'produtividade': 'PROD. MÉDIA'},
+             text='count',
+             template='seaborn',
+             title='<b> Prod. Média por estação de colheita - variedade ' +
+             top_variety.index[0])
+fig.update_yaxes(tickformat="000")
+fig.update_traces(textfont_size=8)
+fig.show()
+```
+
+
+## Variedade 2
+
+```{python}
+# | code-fold: true
+talhao_meteorologia_data_variety_2 = talhao_meteorologia_data[
+    (talhao_meteorologia_data['variedade'] == top_variety.index[1])]
+
+grouped_data = talhao_meteorologia_data_variety_2.groupby(
+    'estacao_colheita')['produtividade'].agg([
+        'mean', 'count']).reset_index()
+
+grouped_data.columns = ['estacao_colheita', 'produtividade', 'count']
+mean_productivity = grouped_data.sort_values(by='produtividade',
+                                             ascending=False)
+
+mean_productivity['produtividade'] = round(mean_productivity[
+    'produtividade'], 2)
+
+fig = px.bar(mean_productivity, x='estacao_colheita', y='produtividade',
+             color='estacao_colheita',
+             labels={'estacao_colheita': 'ESTAÇÃO COLHEITA',
+                     'produtividade': 'PROD. MÉDIA'},
+             text='count',
+             template='seaborn',
+             title='<b> Prod. Média por estação de colheita - variedade ' +
+             top_variety.index[1])
+fig.update_yaxes(tickformat="000")
+fig.update_traces(textfont_size=8)
+fig.show()
+```
+
+
+## Variedade 3
+
+```{python}
+# | code-fold: true
+talhao_meteorologia_data_variety_3 = talhao_meteorologia_data[
+    (talhao_meteorologia_data['variedade'] == top_variety.index[2])]
+
+grouped_data = talhao_meteorologia_data_variety_3.groupby(
+    'estacao_colheita')['produtividade'].agg([
+        'mean', 'count']).reset_index()
+
+grouped_data.columns = ['estacao_colheita', 'produtividade', 'count']
+mean_productivity = grouped_data.sort_values(by='produtividade',
+                                             ascending=False)
+
+mean_productivity['produtividade'] = round(mean_productivity[
+    'produtividade'], 2)
+
+fig = px.bar(mean_productivity, x='estacao_colheita', y='produtividade',
+             color='estacao_colheita',
+             labels={'estacao_colheita': 'ESTAÇÃO DE COLHEITA',
+                     'produtividade': 'PROD. MÉDIA'},
+             text='count',
+             template='seaborn',
+             title='<b> Prod. Média por estação de colheita - variedade ' +
+             top_variety.index[2])
+fig.update_yaxes(tickformat="000")
+fig.update_traces(textfont_size=8)
+fig.show()
+```
+
+:::
+
+Padrões diferentes são observados quando isolamos as variedades, embora a variedade 980 tenha apresentado padrão similar ao visto nos dados em geral.
+
+### Clusters com base na localização espacial e produtividade
+
+Outro provável fator que pode afetar a produtividade é a localização do talhão em que ela foi plantada.
+Na análise abaixo, os talhões foram agrupados em clusters, e suas produtividades médias (clusters) foram avaliadas.
+
+```{python}
+# | code-fold: true
+talhao_spatial_data = talhao_spatial_data.dropna(subset='geometry')
+talhao_spatial_data = talhao_spatial_data.replace([np.inf, -np.inf],
+                                                            np.nan)
+talhao_spatial_data = talhao_spatial_data.apply(
+    lambda x: pd.to_numeric(x, errors='ignore'))
+talhao_spatial_data = talhao_spatial_data.dropna(subset='produtivid')
+talhao_spatial_data = talhao_spatial_data[np.isfinite(
+    talhao_spatial_data['produtivid'])]
+talhao_spatial_data['centroid'] = talhao_spatial_data['geometry'].centroid
+
+# Coordenadas dos pontos centroides
+talhao_spatial_data['x'] = talhao_spatial_data['centroid'].x
+talhao_spatial_data['y'] = talhao_spatial_data['centroid'].y
+X = talhao_spatial_data[['x', 'y']]
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+dbscan = DBSCAN(eps=0.1, min_samples=2)
+
+talhao_spatial_data['cluster'] = dbscan.fit_predict(X_scaled)
+
+talhao_spatial_data.head()
+```
+
+
+```{python}
+# | code-fold: true
+talhao_spatial_data['cluster'] = talhao_spatial_data[
+    'cluster'].astype(str)
+
+grouped_data = talhao_spatial_data.groupby('cluster')[
+    'produtivid'].agg(['mean', 'count']).reset_index()
+
+grouped_data.columns = ['cluster', 'produtivid', 'count']
+mean_productivity = grouped_data.sort_values(by='produtivid',
+                                             ascending=False)
+
+mean_productivity['produtivid'] = round(mean_productivity[
+    'produtivid'], 2)
+
+fig = px.bar(mean_productivity, x='cluster', y='produtivid',
+             color='cluster',
+             labels={'cluster': 'CLUSTER',
+                     'produtivid': 'PROD. MÉDIA'},
+             text='count',
+             template='seaborn',
+             title='<b> Prod. Média por cluster')
+fig.update_yaxes(tickformat="000")
+fig.update_traces(textfont_size=8)
+fig.show()
+```
+
+
+```{python}
+# | code-fold: true
+kruskal_nemenyi(data=talhao_spatial_data,
+                col_cat='cluster',
+                col_num='produtivid')
+
+talhao_spatial_data.groupby('cluster')[
+    'produtivid'].describe()
+```
+
+Foram encontrados 3 clusters, mas a hipótese de que suas produtividades são iguais não pôde ser rejeitada.
+
+## Etapa 3: Mapa da Produtividade por Fazenda
+
+```{python}
+# | code-fold: true
+# Produtividade média por fazenda
+produtividade_media = talhao_spatial_data.groupby('fznd_nm')[
+    'produtivid'].mean().reset_index()
+
+talhao_spatial_data = talhao_spatial_data.merge(
+    produtividade_media, on='fznd_nm', suffixes=('', '_media'))
+
+fig, ax = plt.subplots(figsize=(10, 10))
+
+talhao_spatial_data.plot(ax=ax, column='produtivid', cmap='YlGnBu',
+                         legend=True, legend_kwds={'label': "Produtividade"})
+ctx.add_basemap(ax, crs=talhao_spatial_data.crs.to_string(),
+                source=ctx.providers.OpenStreetMap.Mapnik)
+
+plt.show()
+```
+
+
+Três clusters visíveis, porém não há grande diferença entre eles quanto a produtividade, apesar de alguns talhões se destacarem com relação a outros.
+
+```{python}
+# | code-fold: true
+# Dados para a safra '19/20'
+talhao_spatial_data_2020 = talhao_spatial_data[talhao_spatial_data[
+    'safra'] == 'Safra 19/20']
+talhao_spatial_data_2020 = talhao_spatial_data_2020.dropna(subset=['produtivid'])
+
+# Centróide de cada polígono
+talhao_spatial_data_2020['centroid'] = talhao_spatial_data_2020['geometry'].centroid
+centroids = talhao_spatial_data_2020['centroid']
+
+x = centroids.x
+y = centroids.y
+z = talhao_spatial_data_2020['produtivid']
+
+x_min, x_max = x.min(), x.max()
+y_min, y_max = y.min(), y.max()
+xi = np.linspace(x_min, x_max, 100)
+yi = np.linspace(y_min, y_max, 100)
+xi, yi = np.meshgrid(xi, yi)
+
+# Interpolação
+zi = griddata((x, y), z, (xi, yi), method='linear')
+
+plt.figure(figsize=(10, 10))
+plt.pcolormesh(xi, yi, zi, shading='auto', cmap='viridis')
+plt.scatter(x, y, c=z, cmap='viridis', edgecolor='k', marker='o')
+plt.colorbar(label='Produtividade')
+plt.title('Interpolação da Produtividade da Soja - Safra 19/20')
+plt.xlabel('Longitude')
+plt.ylabel('Latitude')
+plt.show()
+```
+
+
+## Etapa 4: Decomposição das séries temporais
+
+```{python}
+# | code-fold: true
+# talhao_spatial_data['data_plant'] = pd.to_datetime(talhao_spatial_data['data_plant'], format='%Y-%m-%d')
+# talhao_spatial_data['MONTH_YEAR'] = talhao_spatial_data['data_plant'].dt.to_period('M')
+
+# # A análise será conduzida para a região do cluster 0
+# result = talhao_spatial_data[talhao_spatial_data['cluster'] == '0'].groupby('MONTH_YEAR')['leitura_va'].mean().reset_index()
+
+# all_months = pd.period_range(start=result['MONTH_YEAR'].min(), end=result['MONTH_YEAR'].max(), freq='M')
+# all_months = pd.DataFrame({'MONTH_YEAR': all_months})
+
+# merged_data = all_months.merge(result, on='MONTH_YEAR', how='left')
+# merged_data['leitura_va'] = merged_data['leitura_va'].fillna(0)
+
+# merged_data['MONTH_YEAR'] = pd.to_datetime(merged_data['MONTH_YEAR'].dt.to_timestamp(how='end'))
+
+# merged_data.set_index('MONTH_YEAR', inplace=True)
+
+# decomposition = seasonal_decompose(merged_data, model='additive')
+
+# decomposition.plot()
+# plt.savefig('reports/figures/decomposition_plot.png')
+
+# # Teste ADF
+# result_adf = adfuller(merged_data['leitura_va'])
+# print('Estatística ADF:', result_adf[0])
+# print('Valor-p:', result_adf[1])
+# print('Valores críticos:', result_adf[4])
+# for key, value in result_adf[4].items():
+#     print('\t%s: %.3f' % (key, value))
+
+# with open('reports/metrics/adf_results.txt', 'w') as f:
+#     f.write(f'Estatística ADF: {result_adf[0]}\n')
+#     f.write(f'Valor-p: {result_adf[1]}\n')
+#     f.write('Valores críticos:\n')
+#     for key, value in result_adf[4].items():
+#         f.write(f'\t{key}: {value}\n')
+
+img = mpimg.imread('reports/figures/decomposition_plot.png')
+plt.imshow(img)
+plt.axis('off')
+plt.show()
+
+with open('reports/metrics/adf_results.txt', 'r') as f:
+    content = f.read()
+    print(content)
+```
+
+
+Existe tendência negativa e sazonalidade clara.
+
+O teste Dickey-Fuller mostra que existem evidências de que devemos aceitar a hipótese de que a série é não estacionária.
+
+
+### Funções de Autocorrelação
+
+```{python}
+# | code-fold: true
+# Função de autocorrelação
+# plot_acf(temporal_analysis, lags=10)
+# plt.title('Função de Autocorrelação (ACF)')
+# plt.savefig('reports/figures/acf_plot.png')
+
+# # Função de autocorrelação parcial (PACF)
+# plot_pacf(temporal_analysis, lags=10)
+# plt.title('Função de Autocorrelação Parcial (PACF)')
+# plt.savefig('reports/figures/pacf_plot.png')
+
+img = mpimg.imread('reports/figures/acf_plot.png')
+plt.imshow(img)
+plt.axis('off')
+plt.show()
+
+img = mpimg.imread('reports/figures/pacf_plot.png')
+plt.imshow(img)
+plt.axis('off')
+plt.show()
+```
+
+
+Pela autocorrelação, como existe sazonalidade, a autocorrelação aumenta periodicamente em atrasos maiores, inclusive com significância. 
+
+Autocorrelação parcial: termo auto-regressivo de ordem 2.
